@@ -1,0 +1,17 @@
+# Local agent configuration (contains the DeepSeek API key)
+.rtl-agent/
+
+# Per-task run artifacts and logs
+runs/
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Simulator build artifacts
+*.vvp
