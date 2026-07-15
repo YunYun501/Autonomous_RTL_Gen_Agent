@@ -245,6 +245,7 @@ class ToolRegistry:
         if not code.strip():
             return {"error": "code_str is empty."}
 
+        self.run.ensure()
         path = self.run.path(f"{module_name}.v")
         path.write_text(code, encoding="utf-8")
         self.dut_path = path
@@ -278,6 +279,7 @@ class ToolRegistry:
         if not trace["valid"]:
             return {"ok": False, "errors": trace["errors"], "traceability": trace}
 
+        self.run.ensure()
         path = self.run.path(f"tb_{module_name}.v")
         path.write_text(code, encoding="utf-8")
         self.tb_path = path

@@ -65,20 +65,34 @@ class RunContext:
         self.log(f"Snapshotted and froze {len(prompts)} prompt(s).")
         return hashes
 
+    def ensure(self) -> None:
+        """Recreate the run directory tree if it was removed while a task runs.
+
+        Makes writes resilient to the run directory disappearing mid-task (e.g. an
+        external cleanup) so a single filesystem hiccup never aborts the task or
+        loses generated RTL.
+        """
+        self.dir.mkdir(parents=True, exist_ok=True)
+        for sub in ("prompts", "rtl_versions", "testbench_versions", "simulation_logs"):
+            (self.dir / sub).mkdir(exist_ok=True)
+
     # -- source versioning --------------------------------------------------
     def save_rtl_version(self, code: str) -> Path:
+        self.ensure()
         self._rtl_attempts += 1
         path = self.dir / "rtl_versions" / f"attempt_{self._rtl_attempts:02d}.v"
         path.write_text(code, encoding="utf-8")
         return path
 
     def save_testbench_version(self, code: str) -> Path:
+        self.ensure()
         self._tb_attempts += 1
         path = self.dir / "testbench_versions" / f"attempt_{self._tb_attempts:02d}.v"
         path.write_text(code, encoding="utf-8")
         return path
 
     def save_simulation_log(self, result: dict) -> Path:
+        self.ensure()
         self._sim_attempts += 1
         path = self.dir / "simulation_logs" / f"attempt_{self._sim_attempts:02d}.json"
         path.write_text(json.dumps(result, indent=2), encoding="utf-8")
@@ -86,6 +100,7 @@ class RunContext:
 
     # -- generic artifact + json -------------------------------------------
     def write_json(self, filename: str, data: dict) -> Path:
+        self.ensure()
         path = self.dir / filename
         path.write_text(json.dumps(data, indent=2), encoding="utf-8")
         return path
@@ -95,11 +110,20 @@ class RunContext:
 
     # -- logging ------------------------------------------------------------
     def log(self, line: str) -> None:
+        # Auxiliary: never let a logging failure crash the task.
         stamp = datetime.now().strftime("%H:%M:%S")
-        with self.run_log_path.open("a", encoding="utf-8") as fh:
-            fh.write(f"[{stamp}] {line}\n")
+        try:
+            self.dir.mkdir(parents=True, exist_ok=True)
+            with self.run_log_path.open("a", encoding="utf-8") as fh:
+                fh.write(f"[{stamp}] {line}\n")
+        except OSError:
+            pass
 
     def log_api_call(self, record: dict) -> None:
         record = {"timestamp": datetime.now().isoformat(), **record}
-        with self.api_log_path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        try:
+            self.dir.mkdir(parents=True, exist_ok=True)
+            with self.api_log_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except OSError:
+            pass
