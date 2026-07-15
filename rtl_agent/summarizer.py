@@ -1,9 +1,11 @@
-"""Parallel, independent summary agent.
+"""Parallel, independent stage-summary agent.
 
-Summarizes each step the main agent takes, running in background threads so it
-never blocks the main workflow. It is deliberately isolated: it uses its own
-DeepSeek client and each summary is a fresh, stateless request containing only the
-one step being described. It never shares the main agent's conversation history.
+Summarizes each STAGE of the main agent's work (specification, verification
+planning, RTL/testbench generation, and each reflection cycle), running in
+background threads so it never blocks the main workflow. It is deliberately
+isolated: it uses its own DeepSeek client and each summary is a fresh, stateless
+request containing only the one stage being described. It never shares the main
+agent's conversation history.
 """
 
 from __future__ import annotations
@@ -15,15 +17,21 @@ from typing import Callable
 from .deepseek_client import DeepSeekClient, DeepSeekError
 
 SUMMARY_SYSTEM_PROMPT = (
-    "You summarize a single step taken by an autonomous RTL (Verilog) design "
-    "agent. You are given only that one step: its private reasoning and the action "
-    "it took. Reply with ONE concise, information-dense sentence (max 30 words) "
-    "stating what the step was actually about and what it concluded or did. Focus "
-    "on concrete design/verification decisions (ports, reset, timing, FSM states, "
-    "checks, failures). No preamble, no markdown, no quotes."
+    "You are a technical writer summarizing ONE stage of an autonomous RTL "
+    "(Verilog) design-and-verification agent's work. You are given that stage's "
+    "private reasoning together with the tool actions and results it produced.\n\n"
+    "Write ONE to TWO short paragraphs (roughly 90-170 words total) in plain "
+    "technical English covering: (1) what the agent was trying to accomplish in "
+    "this stage; (2) the concrete design or verification decisions it made -- e.g. "
+    "module interface and ports, reset scheme (polarity/synchrony), clocking and "
+    "timing, FSM states and durations, counter widths, specific VP-* checks, and "
+    "any failures diagnosed and how they were fixed; and (3) the outcome of the "
+    "stage. Be specific and grounded in the provided material; never invent "
+    "details. Do not use markdown, headings, bullet lists, or any preamble -- "
+    "return only the summary prose."
 )
 
-OnSummary = Callable[[int, str, str], None]
+OnSummary = Callable[[str, str], None]
 
 
 class SummaryAgent:
@@ -50,35 +58,35 @@ class SummaryAgent:
     def enabled(self) -> bool:
         return self._enabled
 
-    def submit(self, seq: int, stage: str, text: str) -> None:
+    def submit(self, label: str, text: str) -> None:
         if not self._enabled or self._executor is None:
             return
-        fut = self._executor.submit(self._run, seq, stage, text)
+        fut = self._executor.submit(self._run, label, text)
         with self._lock:
             self._futures.append(fut)
 
-    def _run(self, seq: int, stage: str, text: str) -> None:
+    def _run(self, label: str, text: str) -> None:
         try:
-            raw = self._client.simple_completion(
+            summary = self._client.simple_completion(
                 [
                     {"role": "system", "content": SUMMARY_SYSTEM_PROMPT},
-                    {"role": "user", "content": text[:6000]},
+                    {"role": "user", "content": text[:16000]},
                 ],
-                timeout=45.0,
-                max_tokens=120,
+                timeout=60.0,
+                max_tokens=900,
             )
-            summary = " ".join((raw or "").split()) or "(no summary returned)"
+            summary = summary.strip() or "(no summary produced)"
         except DeepSeekError as exc:
             summary = f"(summary unavailable: {exc})"
         except Exception as exc:  # noqa: BLE001
             summary = f"(summary error: {exc})"
         try:
-            self._on_summary(seq, stage, summary)
+            self._on_summary(label, summary)
         except Exception:  # noqa: BLE001 - never let a UI callback kill the worker
             pass
 
-    def drain(self, timeout: float = 8.0) -> None:
-        """Wait briefly for in-flight summaries so they print before we move on."""
+    def drain(self, timeout: float = 30.0) -> None:
+        """Wait for in-flight stage summaries so they print before we move on."""
         if not self._enabled:
             return
         with self._lock:

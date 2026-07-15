@@ -50,7 +50,7 @@ class Controller:
         assessment_context: str = "self_verified",
         on_stream: Callable[[str, str], None] | None = None,
         on_step: Callable[[str, str], None] | None = None,
-        on_message: Callable[[int, str, str], None] | None = None,
+        on_stage: Callable[[str, str], None] | None = None,
     ):
         self.config = config
         self.prompts = prompts
@@ -60,21 +60,34 @@ class Controller:
         self.assessment_context = assessment_context
         self.on_stream = on_stream
         self.on_step = on_step or (lambda kind, summary: None)
-        self.on_message = on_message or (lambda seq, stage, text: None)
+        # Called once per stage with (label, full stage transcript) for summarizing.
+        self.on_stage = on_stage or (lambda label, text: None)
         self._turn = 0
+        self._sim_attempts = 0
+        self._reflections = 0
         self._should_cancel: Callable[[], bool] = lambda: False
 
     # -- public entrypoint --------------------------------------------------
     def run_task(self, request: str, should_cancel: Callable[[], bool] | None = None) -> TaskResult:
         self._should_cancel = should_cancel or (lambda: False)
         run = RunContext(request, module_hint=request)
-        run.snapshot_prompts(self.prompts)
+        hashes = run.snapshot_prompts(self.prompts)
+        run.log_task_header(
+            request,
+            self.config.masked_key(),
+            self.config.iverilog_path,
+            self.config.vvp_path,
+            self.prompts,
+            hashes,
+        )
         registry = ToolRegistry(self.config, run, self.assessment_context)
         try:
             return self._pipeline(request, run, registry)
         except TaskAborted:
-            run.log("ABORTED: task terminated by user (Esc).")
             self.progress("Task terminated.")
+            run.log_final("ABORTED", self._sim_attempts, self._reflections,
+                          "Terminated by user before completion.",
+                          registry.dut_path, registry.tb_path)
             return TaskResult(
                 status="ABORTED",
                 run_dir=str(run.dir),
@@ -85,6 +98,8 @@ class Controller:
 
     def _pipeline(self, request: str, run: RunContext, registry: ToolRegistry) -> TaskResult:
         self._turn = 0
+        self._sim_attempts = 0
+        self._reflections = 0
         client = DeepSeekClient(
             self.config.deepseek_api_key,
             on_call=run.log_api_call,
@@ -98,40 +113,46 @@ class Controller:
         # Stage: specification.
         self.progress("Interpreting the specification...")
         messages.append({"role": "user", "content": self.prompts["specification_prompt.md"]})
+        run.log_stage("SPECIFICATION", self.prompts["specification_prompt.md"])
         if not self._run_stage(client, messages, registry, "specification",
-                               stop=lambda r: r.generation_gate_open):
+                               stop=lambda r: r.generation_gate_open,
+                               label="Specification"):
             return self._fail(run, registry, "INFRASTRUCTURE_FAILED", "Design spec was not accepted.")
 
         # Stage: verification planning.
         self.progress("Creating a verification plan...")
         messages.append({"role": "user", "content": self.prompts["verification_prompt.md"]})
+        run.log_stage("VERIFICATION PLANNING", self.prompts["verification_prompt.md"])
         if not self._run_stage(client, messages, registry, "verification",
-                               stop=lambda r: r.verification_gate_open):
+                               stop=lambda r: r.verification_gate_open,
+                               label="Verification planning"):
             return self._fail(run, registry, "INFRASTRUCTURE_FAILED", "Verification plan was not accepted.")
 
         # Stage: RTL + testbench generation + first simulation.
         self.progress("Generating RTL and self-checking testbench...")
         messages.append({"role": "user", "content": self.prompts["testbench_prompt.md"]})
+        run.log_stage("RTL + TESTBENCH GENERATION", self.prompts["testbench_prompt.md"])
         self._run_stage(client, messages, registry, "generation",
-                        stop=lambda r: r.last_sim_result is not None)
+                        stop=lambda r: r.last_sim_result is not None,
+                        label="RTL & testbench generation")
 
-        sim_attempts = 1 if registry.last_sim_result is not None else 0
         if registry.last_sim_result is None:
             return self._fail(run, registry, "INFRASTRUCTURE_FAILED", "No simulation was run.")
+        self._sim_attempts = 1
 
         result = registry.last_sim_result
         self.progress(f"[Simulation attempt 1/{MAX_SIMULATION_ATTEMPTS}] "
                       + ("PASS" if result["passed"] else "FAIL"))
+        run.log_attempt(1, MAX_SIMULATION_ATTEMPTS, result["passed"], result.get("failure_type"))
 
         # Reflection loop.
-        reflection_cycles = 0
-        while not result["passed"] and reflection_cycles < MAX_REFLECTION_CYCLES:
+        while not result["passed"] and self._reflections < MAX_REFLECTION_CYCLES:
             if self._should_cancel():
                 raise TaskAborted()
-            reflection_cycles += 1
+            self._reflections += 1
             diagnosis = summarize_failure(result)
-            self.progress(f"[Reflection cycle {reflection_cycles}/{MAX_REFLECTION_CYCLES}] {diagnosis}")
-            run.log(f"Reflection {reflection_cycles}: {diagnosis}")
+            self.progress(f"[Reflection cycle {self._reflections}/{MAX_REFLECTION_CYCLES}] {diagnosis}")
+            run.log_reflection(self._reflections, MAX_REFLECTION_CYCLES, diagnosis)
 
             messages.append({
                 "role": "user",
@@ -139,84 +160,102 @@ class Controller:
                 + "\n\n## Latest simulation result\n"
                 + _sim_digest(result),
             })
+            run.log_stage(f"REFLECTION {self._reflections}", self.prompts["reflection_prompt.md"])
             before = registry.last_sim_result
             self._run_stage(client, messages, registry, "reflection",
-                            stop=lambda r, b=before: r.last_sim_result is not b)
+                            stop=lambda r, b=before: r.last_sim_result is not b,
+                            label=f"Reflection {self._reflections}")
             if registry.last_sim_result is before:
                 run.log("Reflection produced no new simulation; terminating.")
                 break
             result = registry.last_sim_result
-            sim_attempts += 1
-            self.progress(f"[Simulation attempt {sim_attempts}/{MAX_SIMULATION_ATTEMPTS}] "
+            self._sim_attempts += 1
+            self.progress(f"[Simulation attempt {self._sim_attempts}/{MAX_SIMULATION_ATTEMPTS}] "
                           + ("PASS" if result["passed"] else "FAIL"))
+            run.log_attempt(self._sim_attempts, MAX_SIMULATION_ATTEMPTS, result["passed"],
+                            result.get("failure_type"))
 
         status = "SUCCESS_INTERNAL" if result["passed"] else "DEVELOPMENT_FAILED"
-        run.log(f"Final status: {status} "
-                f"(attempts={sim_attempts}, reflections={reflection_cycles})")
+        detail = "internal verification passed" if result["passed"] else summarize_failure(result)
+        run.log_final(status, self._sim_attempts, self._reflections, detail,
+                      registry.dut_path, registry.tb_path)
         return TaskResult(
             status=status,
             run_dir=str(run.dir),
             dut_path=str(registry.dut_path) if registry.dut_path else None,
             testbench_path=str(registry.tb_path) if registry.tb_path else None,
-            simulation_attempts=sim_attempts,
-            reflection_cycles=reflection_cycles,
-            detail=summarize_failure(result) if not result["passed"] else "internal verification passed",
+            simulation_attempts=self._sim_attempts,
+            reflection_cycles=self._reflections,
+            detail=detail,
         )
 
     # -- agentic loop for a single stage -----------------------------------
-    def _run_stage(self, client, messages, registry: ToolRegistry, stage: str, stop) -> bool:
+    def _run_stage(self, client, messages, registry: ToolRegistry, stage: str, stop,
+                   label: str | None = None) -> bool:
+        label = label or stage
         tools = registry.tools_for_stage(stage)
-        for _ in range(MAX_TURNS_PER_STAGE):
-            if self._should_cancel():
-                raise TaskAborted()
-            try:
-                message = client.chat(messages, tools=tools, on_delta=self.on_stream)
-            except Exception as exc:  # noqa: BLE001 - transient API errors don't consume cycles
-                registry.run.log(f"API error in {stage}: {exc}")
-                return _stopped(registry, stop)
+        transcript: list[str] = []  # everything that happened this stage, for the summary
 
-            messages.append(assistant_message_to_dict(message))
-            tool_calls = getattr(message, "tool_calls", None)
+        try:
+            for _ in range(MAX_TURNS_PER_STAGE):
+                if self._should_cancel():
+                    raise TaskAborted()
+                try:
+                    message = client.chat(messages, tools=tools, on_delta=self.on_stream)
+                except Exception as exc:  # noqa: BLE001 - transient API errors don't consume cycles
+                    registry.run.log(f"API error in {stage}: {exc}")
+                    return _stopped(registry, stop)
 
-            # Hand this whole turn to the parallel summary agent (fire-and-forget).
-            raw_turn = _assistant_turn_text(message)
-            if raw_turn:
+                messages.append(assistant_message_to_dict(message))
+                tool_calls = getattr(message, "tool_calls", None)
+
+                # Full transcript of this assistant turn (thinking + response + calls).
                 self._turn += 1
-                self.on_message(self._turn, stage, raw_turn)
-                registry.run.log(f"[turn {self._turn} / {stage}] {_summarize_thinking(message)}")
+                registry.run.log_assistant_turn(self._turn, stage, message)
+                raw_turn = _assistant_turn_text(message)
+                if raw_turn:
+                    transcript.append(raw_turn)
 
-            if not tool_calls:
-                # Model produced final text with no tool call; nothing more to do.
-                return _stopped(registry, stop)
+                if not tool_calls:
+                    return _stopped(registry, stop)
 
-            for call in tool_calls:
-                result = registry.dispatch(call.function.name, call.function.arguments)
-                tool_summary = _summarize_tool(call.function.name, result)
-                self.on_step("tool", tool_summary)
-                registry.run.log(f"[tool-done] {tool_summary}")
-                # Intercept user-clarification requests during the spec stage.
-                if result.get("clarification_questions"):
-                    answer = self.ask_user(result["clarification_questions"])
+                for call in tool_calls:
+                    result = registry.dispatch(call.function.name, call.function.arguments)
+                    registry.run.log_tool_result(call.function.name, result)
+                    tool_summary = _summarize_tool(call.function.name, result)
+                    self.on_step("tool", tool_summary)
+                    transcript.append(f"Tool result -> {tool_summary}")
+                    # Intercept user-clarification requests during the spec stage.
+                    if result.get("clarification_questions"):
+                        answer = self.ask_user(result["clarification_questions"])
+                        registry.run.log_clarification(result["clarification_questions"], answer)
+                        transcript.append(f"User clarification -> {answer}")
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": call.id,
+                            "content": json.dumps(result),
+                        })
+                        if answer:
+                            messages.append({"role": "user", "content": f"Clarification: {answer}"})
+                        continue
                     messages.append({
                         "role": "tool",
                         "tool_call_id": call.id,
-                        "content": json.dumps(result),
+                        "content": json.dumps(result)[:20000],
                     })
-                    if answer:
-                        messages.append({"role": "user", "content": f"Clarification: {answer}"})
-                    continue
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": call.id,
-                    "content": json.dumps(result)[:20000],
-                })
 
-            if _stopped(registry, stop):
-                return True
-        return _stopped(registry, stop)
+                if _stopped(registry, stop):
+                    return True
+            return _stopped(registry, stop)
+        finally:
+            # One stage-level summary request, regardless of how the stage ended.
+            if transcript:
+                combined = f"STAGE: {label}\n\n" + "\n\n---\n\n".join(transcript)
+                self.on_stage(label, combined)
 
     def _fail(self, run, registry, status, detail) -> TaskResult:
-        run.log(f"{status}: {detail}")
+        run.log_final(status, self._sim_attempts, self._reflections, detail,
+                      registry.dut_path, registry.tb_path)
         return TaskResult(
             status=status,
             run_dir=str(run.dir),

@@ -185,7 +185,6 @@ class ToolRegistry:
 
         if handler is None:
             return {"error": f"Unknown tool: {name}"}
-        self.run.log(f"[tool] {name}")
         return handler(args)
 
     # -- handlers -----------------------------------------------------------
@@ -206,7 +205,6 @@ class ToolRegistry:
             self.run.write_json("design_spec.json", self.design_spec)
             self.generation_gate_open = True
             result["saved_path"] = str(self.run.path("design_spec.json"))
-            self.run.log("Design spec accepted; generation gate open.")
         else:
             result["saved_path"] = None
             result["draft_path"] = str(self.run.path("design_spec.draft.json"))
@@ -232,7 +230,6 @@ class ToolRegistry:
             self.verification_gate_open = True
             result["saved_json_path"] = str(self.run.path("verification_plan.json"))
             result["saved_markdown_path"] = str(self.run.path("verification_plan.md"))
-            self.run.log(f"Verification plan frozen; required ids: {self.required_ids}")
         return result
 
     def _write_verilog_file(self, args: dict) -> dict:
@@ -251,7 +248,6 @@ class ToolRegistry:
         self.dut_path = path
         version = self.run.save_rtl_version(code)
         digest = sha256_text(code)
-        self.run.log(f"Wrote DUT {path.name} (sha256 {digest[:12]}).")
         return {
             "path": str(path),
             "bytes": len(code.encode("utf-8")),
@@ -284,7 +280,6 @@ class ToolRegistry:
         path.write_text(code, encoding="utf-8")
         self.tb_path = path
         self.run.save_testbench_version(code)
-        self.run.log(f"Wrote testbench {path.name}; covers {sorted(set(covered))}.")
         return {"path": str(path), "ok": True, "traceability": trace}
 
     def _read_current_design(self, args: dict) -> dict:
@@ -306,8 +301,6 @@ class ToolRegistry:
         result = _run_simulation(self.config, self.run.dir, self.dut_path, self.tb_path)
         self.last_sim_result = result
         self.run.save_simulation_log(result)
-        status = "PASS" if result["passed"] else f"FAIL ({result['failure_type']})"
-        self.run.log(f"Simulation: {status}")
         return result
 
 

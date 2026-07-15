@@ -161,24 +161,36 @@ class DeepSeekClient:
         return message
 
     def simple_completion(
-        self, messages: list[dict], timeout: float = 45.0, max_tokens: int = 160
+        self, messages: list[dict], timeout: float = 60.0, max_tokens: int = 900
     ) -> str:
-        """A lightweight, non-thinking completion for auxiliary tasks (summaries).
+        """A lightweight completion for auxiliary tasks (summaries).
 
-        Deliberately omits thinking mode and reasoning_effort so it is fast and
-        cheap. Each call is independent -- callers pass exactly the messages they
-        want and no history is retained.
+        deepseek-v4-pro is a reasoning model, so we ask it to run WITHOUT thinking
+        to get direct content quickly (falling back to a plain call if the API
+        rejects the flag). If content is still empty we fall back to any
+        reasoning_content. Each call is independent -- no history is retained.
         """
+        base = dict(
+            model=DEEPSEEK_MODEL,
+            messages=messages,
+            max_tokens=max_tokens,
+            timeout=timeout,
+        )
         try:
             response = self._client.chat.completions.create(
-                model=DEEPSEEK_MODEL,
-                messages=messages,
-                max_tokens=max_tokens,
-                timeout=timeout,
+                **base, extra_body={"thinking": {"type": "disabled"}}
             )
-        except Exception as exc:  # noqa: BLE001
-            raise DeepSeekError(str(exc)) from exc
-        return response.choices[0].message.content or ""
+        except Exception:  # noqa: BLE001 - flag may be unsupported; retry plain
+            try:
+                response = self._client.chat.completions.create(**base)
+            except Exception as exc:  # noqa: BLE001
+                raise DeepSeekError(str(exc)) from exc
+
+        message = response.choices[0].message
+        content = (message.content or "").strip()
+        if not content:
+            content = (getattr(message, "reasoning_content", None) or "").strip()
+        return content
 
     def validate_key(self, timeout: float = 60.0) -> bool:
         """Minimal request used by startup preflight to validate the API key."""

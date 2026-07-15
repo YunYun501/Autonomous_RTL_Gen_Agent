@@ -11,6 +11,7 @@ import getpass
 import re
 import shutil
 import sys
+import textwrap
 import threading
 import time
 from pathlib import Path
@@ -362,15 +363,17 @@ class TerminalUI:
             status.note(f"    {kind}: {summary}")
 
         # Parallel, independent summary agent (its own client, no shared history).
-        def on_summary(seq, stage, text):
-            status.note(f"    [summary #{seq}] {text}")
+        def on_summary(label, text):
+            body = "\n".join(
+                textwrap.fill(line, width=88, initial_indent="      ",
+                              subsequent_indent="      ")
+                for line in text.splitlines() or [text]
+            )
+            status.note(f"    --- summary: {label} ---\n{body}")
 
         summarizer = SummaryAgent(
             self.config.deepseek_api_key, on_summary, enabled=self._summaries_enabled
         )
-
-        def on_message(seq, stage, text):
-            summarizer.submit(seq, stage, text)
 
         controller = Controller(
             config=self.config,
@@ -380,7 +383,7 @@ class TerminalUI:
             progress=status.set_stage,
             on_stream=status.set_preview,
             on_step=on_step,
-            on_message=on_message,
+            on_stage=summarizer.submit,
         )
         if watcher.available:
             out("[Agent] Working... press Esc to terminate and restore your prompt.")
