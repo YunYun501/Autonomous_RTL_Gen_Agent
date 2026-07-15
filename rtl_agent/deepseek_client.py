@@ -33,8 +33,14 @@ class DeepSeekClient:
         messages: list[dict],
         tools: list[dict] | None = None,
         timeout: float = 120.0,
+        on_delta: Callable[[str, str], None] | None = None,
     ) -> Any:
         """Send one chat completion request and return the assistant message.
+
+        When ``on_delta`` is provided the request is streamed and the callback is
+        invoked with ``(kind, delta_text)`` as tokens arrive -- ``kind`` is one of
+        ``"reasoning"`` (thinking), ``"content"`` (final answer), or ``"tool"`` (a
+        tool name once it appears). This drives the live status bar.
 
         Do not send sampling controls (e.g. temperature) with thinking enabled.
         """
@@ -47,6 +53,9 @@ class DeepSeekClient:
         }
         if tools:
             kwargs["tools"] = tools
+
+        if on_delta is not None:
+            return self._chat_streaming(kwargs, messages, tools, on_delta)
 
         try:
             response = self._client.chat.completions.create(**kwargs)
@@ -71,6 +80,105 @@ class DeepSeekClient:
             )
 
         return message
+
+    def _chat_streaming(self, kwargs, messages, tools, on_delta) -> Any:
+        kwargs = {**kwargs, "stream": True}
+        try:
+            stream = self._client.chat.completions.create(**kwargs)
+        except Exception as exc:  # noqa: BLE001
+            raise DeepSeekError(str(exc)) from exc
+
+        content_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        tool_slots: dict[int, dict] = {}
+        seen_tool_names: set[str] = set()
+        finish_reason = None
+        request_id = None
+        usage = None
+
+        try:
+            for chunk in stream:
+                if getattr(chunk, "usage", None):
+                    usage = chunk.usage
+                if getattr(chunk, "id", None):
+                    request_id = chunk.id
+                if not getattr(chunk, "choices", None):
+                    continue
+                choice = chunk.choices[0]
+                delta = choice.delta
+
+                rc = getattr(delta, "reasoning_content", None)
+                if rc:
+                    reasoning_parts.append(rc)
+                    on_delta("reasoning", rc)
+                if getattr(delta, "content", None):
+                    content_parts.append(delta.content)
+                    on_delta("content", delta.content)
+                for tc in (getattr(delta, "tool_calls", None) or []):
+                    slot = tool_slots.setdefault(tc.index, {"id": None, "name": "", "args": ""})
+                    if getattr(tc, "id", None):
+                        slot["id"] = tc.id
+                    fn = getattr(tc, "function", None)
+                    if fn:
+                        if getattr(fn, "name", None):
+                            slot["name"] = fn.name
+                        if getattr(fn, "arguments", None):
+                            slot["args"] += fn.arguments
+                    if slot["name"] and slot["name"] not in seen_tool_names:
+                        seen_tool_names.add(slot["name"])
+                        on_delta("tool", slot["name"])
+                if getattr(choice, "finish_reason", None):
+                    finish_reason = choice.finish_reason
+        except Exception as exc:  # noqa: BLE001
+            raise DeepSeekError(str(exc)) from exc
+
+        tool_calls = [
+            _ToolCall(tool_slots[i]["id"], tool_slots[i]["name"], tool_slots[i]["args"])
+            for i in sorted(tool_slots)
+        ]
+        message = _StreamedMessage(
+            content="".join(content_parts) or None,
+            reasoning_content="".join(reasoning_parts) or None,
+            tool_calls=tool_calls or None,
+        )
+
+        if self._on_call is not None:
+            self._on_call(
+                {
+                    "model": DEEPSEEK_MODEL,
+                    "request_messages": messages,
+                    "tools": tools,
+                    "finish_reason": finish_reason,
+                    "reasoning_content": message.reasoning_content,
+                    "content": message.content,
+                    "tool_calls": _serialize_tool_calls(message),
+                    "usage": _usage_dict(usage),
+                    "request_id": request_id,
+                    "streamed": True,
+                }
+            )
+
+        return message
+
+    def simple_completion(
+        self, messages: list[dict], timeout: float = 45.0, max_tokens: int = 160
+    ) -> str:
+        """A lightweight, non-thinking completion for auxiliary tasks (summaries).
+
+        Deliberately omits thinking mode and reasoning_effort so it is fast and
+        cheap. Each call is independent -- callers pass exactly the messages they
+        want and no history is retained.
+        """
+        try:
+            response = self._client.chat.completions.create(
+                model=DEEPSEEK_MODEL,
+                messages=messages,
+                max_tokens=max_tokens,
+                timeout=timeout,
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise DeepSeekError(str(exc)) from exc
+        return response.choices[0].message.content or ""
 
     def validate_key(self, timeout: float = 60.0) -> bool:
         """Minimal request used by startup preflight to validate the API key."""
@@ -127,7 +235,10 @@ def _serialize_tool_calls(message: Any) -> list[dict] | None:
 
 
 def _serialize_usage(response: Any) -> dict | None:
-    usage = getattr(response, "usage", None)
+    return _usage_dict(getattr(response, "usage", None))
+
+
+def _usage_dict(usage: Any) -> dict | None:
     if usage is None:
         return None
     try:
@@ -138,3 +249,25 @@ def _serialize_usage(response: Any) -> dict | None:
             "completion_tokens": getattr(usage, "completion_tokens", None),
             "total_tokens": getattr(usage, "total_tokens", None),
         }
+
+
+class _Fn:
+    def __init__(self, name: str, arguments: str):
+        self.name = name
+        self.arguments = arguments
+
+
+class _ToolCall:
+    def __init__(self, id: str | None, name: str, arguments: str):
+        self.id = id
+        self.type = "function"
+        self.function = _Fn(name, arguments)
+
+
+class _StreamedMessage:
+    """Reassembled assistant message, shaped like the non-streaming SDK object."""
+
+    def __init__(self, content, reasoning_content, tool_calls):
+        self.content = content
+        self.reasoning_content = reasoning_content
+        self.tool_calls = tool_calls

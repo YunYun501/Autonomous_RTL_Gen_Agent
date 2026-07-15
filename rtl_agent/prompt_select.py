@@ -64,10 +64,10 @@ def select_option(question: str, options: list[str], allow_other: bool = True) -
     def render():
         lines = [("bold", f"? {question}\n")]
         for i, opt in enumerate(choices):
-            marker = "❯" if i == idx[0] else " "
+            marker = ">" if i == idx[0] else " "
             style = "reverse" if i == idx[0] else ""
             lines.append((style, f" {marker} {i + 1}. {opt}\n"))
-        lines.append(("italic", "   (↑/↓ to move, number to jump, Enter to select, Esc to skip)"))
+        lines.append(("", "   (Up/Down to move, number to jump, Enter to select, Esc to skip)"))
         return lines
 
     control = FormattedTextControl(render, focusable=True, show_cursor=False)

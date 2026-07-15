@@ -59,7 +59,7 @@ def render_markdown(plan: dict) -> str:
     lines.append(f"Module: `{plan.get('module_name', '?')}`")
     lines.append("")
     for req in plan.get("requirements", []):
-        lines.append(f"## {req.get('id')} — {req.get('title', '')}")
+        lines.append(f"## {req.get('id')} - {req.get('title', '')}")
         lines.append(f"- Priority: {req.get('priority', 'required')}")
         src = req.get("requirement_source")
         if src:

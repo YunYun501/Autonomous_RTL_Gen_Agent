@@ -48,6 +48,9 @@ class Controller:
         ask_user: AskUser | None = None,
         progress: Progress | None = None,
         assessment_context: str = "self_verified",
+        on_stream: Callable[[str, str], None] | None = None,
+        on_step: Callable[[str, str], None] | None = None,
+        on_message: Callable[[int, str, str], None] | None = None,
     ):
         self.config = config
         self.prompts = prompts
@@ -55,6 +58,10 @@ class Controller:
         self.ask_user = ask_user or (lambda qs: "")
         self.progress = progress or (lambda msg: None)
         self.assessment_context = assessment_context
+        self.on_stream = on_stream
+        self.on_step = on_step or (lambda kind, summary: None)
+        self.on_message = on_message or (lambda seq, stage, text: None)
+        self._turn = 0
         self._should_cancel: Callable[[], bool] = lambda: False
 
     # -- public entrypoint --------------------------------------------------
@@ -77,6 +84,7 @@ class Controller:
             )
 
     def _pipeline(self, request: str, run: RunContext, registry: ToolRegistry) -> TaskResult:
+        self._turn = 0
         client = DeepSeekClient(
             self.config.deepseek_api_key,
             on_call=run.log_api_call,
@@ -162,7 +170,7 @@ class Controller:
             if self._should_cancel():
                 raise TaskAborted()
             try:
-                message = client.chat(messages, tools=tools)
+                message = client.chat(messages, tools=tools, on_delta=self.on_stream)
             except Exception as exc:  # noqa: BLE001 - transient API errors don't consume cycles
                 registry.run.log(f"API error in {stage}: {exc}")
                 return _stopped(registry, stop)
@@ -170,12 +178,22 @@ class Controller:
             messages.append(assistant_message_to_dict(message))
             tool_calls = getattr(message, "tool_calls", None)
 
+            # Hand this whole turn to the parallel summary agent (fire-and-forget).
+            raw_turn = _assistant_turn_text(message)
+            if raw_turn:
+                self._turn += 1
+                self.on_message(self._turn, stage, raw_turn)
+                registry.run.log(f"[turn {self._turn} / {stage}] {_summarize_thinking(message)}")
+
             if not tool_calls:
                 # Model produced final text with no tool call; nothing more to do.
                 return _stopped(registry, stop)
 
             for call in tool_calls:
                 result = registry.dispatch(call.function.name, call.function.arguments)
+                tool_summary = _summarize_tool(call.function.name, result)
+                self.on_step("tool", tool_summary)
+                registry.run.log(f"[tool-done] {tool_summary}")
                 # Intercept user-clarification requests during the spec stage.
                 if result.get("clarification_questions"):
                     answer = self.ask_user(result["clarification_questions"])
@@ -224,3 +242,81 @@ def _sim_digest(result: dict) -> str:
     if result.get("simulation_stderr"):
         parts.append("simulation_stderr:\n" + result["simulation_stderr"][:1000])
     return "\n".join(parts)
+
+
+def _assistant_turn_text(message) -> str:
+    """Assemble a self-contained description of one assistant turn for the summary
+    agent: its reasoning, any message text, and the actions (tool calls) it took."""
+    reasoning = (getattr(message, "reasoning_content", None) or "").strip()
+    content = (getattr(message, "content", None) or "").strip()
+    parts = []
+    if reasoning:
+        parts.append("Reasoning:\n" + reasoning)
+    if content:
+        parts.append("Message:\n" + content)
+    tool_calls = getattr(message, "tool_calls", None)
+    if tool_calls:
+        actions = []
+        for call in tool_calls:
+            args = call.function.arguments or ""
+            if len(args) > 600:
+                args = args[:600] + "...(truncated)"
+            actions.append(f"{call.function.name}({args})")
+        parts.append("Actions:\n" + "\n".join(actions))
+    return "\n\n".join(parts)
+
+
+def _summarize_thinking(message) -> str:
+    """Cost-free gist of a completed thinking step (no extra API call)."""
+    reasoning = (getattr(message, "reasoning_content", None) or "").strip()
+    content = (getattr(message, "content", None) or "").strip()
+    text = reasoning or content
+    if not text:
+        return ""
+    gist = " ".join(text.split())
+    if len(gist) > 200:
+        gist = gist[:197] + "..."
+    words = len(reasoning.split())
+    return f"({words} words) {gist}" if reasoning else gist
+
+
+def _summarize_tool(name: str, result) -> str:
+    """One-line human-readable summary of a completed tool call."""
+    if not isinstance(result, dict):
+        return f"{name} -> done"
+    if result.get("error"):
+        return f"{name} -> error: {str(result['error'])[:120]}"
+
+    if name == "save_design_spec":
+        status = result.get("validation_status", "?")
+        ready = result.get("ready_for_generation")
+        qs = result.get("clarification_questions") or []
+        extra = f", {len(qs)} question(s)" if qs else ""
+        return f"save_design_spec -> {status} (ready={ready}){extra}"
+    if name == "save_verification_plan":
+        ready = result.get("verification_plan_ready")
+        ids = result.get("required_requirement_ids") or []
+        return f"save_verification_plan -> ready={ready}, {len(ids)} required check(s)"
+    if name == "write_verilog_file":
+        if result.get("ok"):
+            return f"write_verilog_file -> {_basename(result.get('path'))} ({result.get('bytes','?')} bytes)"
+        return "write_verilog_file -> rejected"
+    if name == "write_testbench_file":
+        if result.get("ok"):
+            cov = (result.get("traceability") or {}).get("covered_requirements") or []
+            return f"write_testbench_file -> ok, covers {len(cov)} check(s)"
+        errs = result.get("errors") or []
+        return f"write_testbench_file -> rejected: {errs[0] if errs else 'invalid'}"
+    if name == "read_current_design":
+        return "read_current_design -> returned current artifacts"
+    if name == "run_simulation":
+        if result.get("passed"):
+            return "run_simulation -> PASS"
+        return f"run_simulation -> FAIL ({result.get('failure_type')})"
+    return f"{name} -> done"
+
+
+def _basename(path) -> str:
+    if not path:
+        return "?"
+    return str(path).replace("\\", "/").rsplit("/", 1)[-1]

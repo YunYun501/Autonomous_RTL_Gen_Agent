@@ -1,13 +1,18 @@
 """Terminal-native interface.
 
 A persistent REPL: natural-language entries start a new RTL task; slash commands
-handle configuration, prompt inspection, and diagnostics. Uses rich when available
-and degrades to plain printing otherwise.
+handle configuration, prompt inspection, and diagnostics. Plain-text output only
+(no rich, no Unicode glyphs) so it never fights the terminal.
 """
 
 from __future__ import annotations
 
 import getpass
+import re
+import shutil
+import sys
+import threading
+import time
 from pathlib import Path
 
 from . import config as config_mod
@@ -18,17 +23,116 @@ from .controller import Controller
 from .deepseek_client import DeepSeekClient
 from .interrupt import CancelWatcher
 from .startup import run_preflight, PreflightReport
+from .summarizer import SummaryAgent
 
-try:  # optional pretty output
-    from rich.console import Console
 
-    _console = Console()
+def out(msg: str = "") -> None:
+    print(msg)
 
-    def out(msg: str = "") -> None:
-        _console.print(msg)
-except Exception:  # noqa: BLE001
-    def out(msg: str = "") -> None:
-        print(msg)
+
+class StatusDisplay:
+    """A plain-text status line pinned to the bottom while a task runs.
+
+    Shows the current stage plus a rolling peek at what DeepSeek is streaming,
+    updated in place with a carriage return. Each stage is left on its own line as
+    history when the next stage begins. ASCII only.
+    """
+
+    _KIND_LABEL = {"reasoning": "thinking", "content": "writing", "tool": "tool"}
+    # Minimum seconds between live redraws (throttles the fast-scrolling preview).
+    _MIN_REDRAW_INTERVAL = 0.16
+
+    def __init__(self):
+        self._stage = ""
+        self._kind = ""
+        self._buf = ""
+        self._active = False  # currently on an unfinished (live) line
+        self._tty = bool(getattr(sys.stdout, "isatty", lambda: False)())
+        self._lock = threading.RLock()  # note() is called from summary worker threads
+        self._last_draw = 0.0
+
+    def __enter__(self) -> "StatusDisplay":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        with self._lock:
+            self._finalize()
+
+    def _width(self) -> int:
+        try:
+            return max(20, shutil.get_terminal_size().columns)
+        except Exception:  # noqa: BLE001
+            return 80
+
+    def _line(self) -> str:
+        text = f"[Agent] {self._stage}"
+        if self._buf:
+            label = self._KIND_LABEL.get(self._kind, self._kind)
+            text += f"  {label}: {self._buf}"
+        w = self._width() - 1
+        if len(text) > w:
+            text = text[: w - 3] + "..."
+        return text.ljust(w)  # pad to overwrite any leftover characters
+
+    def _redraw(self, force: bool = False) -> None:
+        if not self._tty:
+            return
+        now = time.monotonic()
+        if not force and (now - self._last_draw) < self._MIN_REDRAW_INTERVAL:
+            return  # throttle: skip this frame, the buffer already holds latest text
+        self._last_draw = now
+        sys.stdout.write("\r" + self._line())
+        sys.stdout.flush()
+        self._active = True
+
+    def _finalize(self) -> None:
+        if self._active:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            self._active = False
+
+    def set_stage(self, stage: str) -> None:
+        with self._lock:
+            self._finalize()  # freeze the previous stage line as history
+            self._stage = stage
+            self._kind = ""
+            self._buf = ""
+            if self._tty:
+                self._redraw(force=True)
+            else:
+                print(f"[Agent] {stage}")
+
+    def set_preview(self, kind: str, delta: str) -> None:
+        if not self._tty:
+            return
+        with self._lock:
+            force = kind != self._kind
+            if force:
+                self._kind = kind
+                self._buf = ""
+            combined = (self._buf + delta).replace("\r", " ").replace("\n", " ")
+            self._buf = re.sub(r"[ \t]{2,}", " ", combined)[-160:]
+            self._redraw(force=force)
+
+    def note(self, text: str) -> None:
+        """Print a persistent summary line above the live status bar (thread-safe)."""
+        with self._lock:
+            was_active = self._active
+            self._finalize()
+            print(text)
+            sys.stdout.flush()
+            if was_active:
+                self._redraw(force=True)
+
+    def pause(self) -> None:
+        with self._lock:
+            self._finalize()
+
+    def resume(self) -> None:
+        with self._lock:
+            if self._stage and self._tty:
+                self._redraw(force=True)
+
 
 try:  # paste-friendly line editing (bracketed paste + history)
     from prompt_toolkit import PromptSession
@@ -45,7 +149,7 @@ BANNER = "RTL Agent startup checks"
 def _print_report(report: PreflightReport) -> None:
     for r in report.results:
         tag = "[PASS]" if r.passed else "[FAIL]"
-        out(f"{tag} {r.name}" + (f" — {r.detail}" if r.detail else ""))
+        out(f"{tag} {r.name}" + (f" - {r.detail}" if r.detail else ""))
 
 
 class TerminalUI:
@@ -53,12 +157,13 @@ class TerminalUI:
         self.config: Config | None = None
         self.prompts: dict[str, str] | None = None
         self._prefill: str = ""  # restores the prompt text after an Esc abort
+        self._summaries_enabled: bool = True  # parallel per-step summary agent
 
     # -- lifecycle ----------------------------------------------------------
     def start(self) -> int:
         out(BANNER)
         if not config_mod.config_exists():
-            out("No configuration found — starting first-time setup.\n")
+            out("No configuration found - starting first-time setup.\n")
             self.config = config_mod.run_first_time_setup()
         else:
             self.config = config_mod.load_config()
@@ -142,13 +247,16 @@ class TerminalUI:
     def _repl(self) -> int:
         # A prompt_toolkit session gives bracketed paste, so a pasted multi-line
         # block is captured as ONE request instead of being split across lines.
+        toolbar = lambda: "deepseek-v4-pro | thinking:max | Enter to run | Esc cancels a running task"
         session = PromptSession(history=InMemoryHistory()) if _HAS_PTK else None
         while True:
             prefill = self._prefill
             self._prefill = ""
             try:
                 if session is not None:
-                    line = session.prompt("rtl-agent> ", default=prefill).strip()
+                    line = session.prompt(
+                        "rtl-agent> ", default=prefill, bottom_toolbar=toolbar
+                    ).strip()
                 else:
                     line = input("rtl-agent> ").strip()
             except (EOFError, KeyboardInterrupt):
@@ -194,6 +302,11 @@ class TerminalUI:
                 out("Master prompts reloaded for the next task.")
             except prompt_loader.PromptLoadError as exc:
                 out(f"[FAIL] {exc}")
+        elif cmd == "/summary":
+            if args and args[0] in ("on", "off"):
+                self._summaries_enabled = args[0] == "on"
+            state = "on" if self._summaries_enabled else "off"
+            out(f"Parallel summary agent is {state}.")
         else:
             out(f"Unknown command: {cmd} (try /help)")
         return False
@@ -208,6 +321,7 @@ class TerminalUI:
         out("  /prompts          Show the prompt directory and filenames")
         out("  /show-prompt <n>  Show one prompt (e.g. system, reflection)")
         out("  /reload-prompts   Reload master prompts for the next task")
+        out("  /summary on|off   Toggle the parallel per-step summary agent")
         out("  /help             Show this help")
         out("  /quit             Exit")
         out("")
@@ -231,34 +345,58 @@ class TerminalUI:
     def _run_request(self, request: str) -> None:
         client = DeepSeekClient(self.config.deepseek_api_key)
         watcher = CancelWatcher()
+        status = StatusDisplay()
 
-        # Pause Esc-watching during clarification prompts so it doesn't steal keys.
+        # Pause Esc-watching and the live bar during clarification prompts so
+        # they don't fight prompt_toolkit for the terminal or steal keystrokes.
         def ask(questions):
             watcher.pause()
+            status.pause()
             try:
                 return self._ask_user(questions)
             finally:
+                status.resume()
                 watcher.resume()
+
+        def on_step(kind, summary):
+            status.note(f"    {kind}: {summary}")
+
+        # Parallel, independent summary agent (its own client, no shared history).
+        def on_summary(seq, stage, text):
+            status.note(f"    [summary #{seq}] {text}")
+
+        summarizer = SummaryAgent(
+            self.config.deepseek_api_key, on_summary, enabled=self._summaries_enabled
+        )
+
+        def on_message(seq, stage, text):
+            summarizer.submit(seq, stage, text)
 
         controller = Controller(
             config=self.config,
             prompts=self.prompts,
             client=client,
             ask_user=ask,
-            progress=lambda msg: out(f"[Agent] {msg}"),
+            progress=status.set_stage,
+            on_stream=status.set_preview,
+            on_step=on_step,
+            on_message=on_message,
         )
         if watcher.available:
             out("[Agent] Working... press Esc to terminate and restore your prompt.")
 
         try:
-            with watcher:
+            with watcher, status:
                 result = controller.run_task(request, should_cancel=lambda: watcher.cancelled)
+            summarizer.drain()  # let in-flight summaries print before the result block
         except Exception as exc:  # noqa: BLE001
             out(f"[ERROR] Task failed: {exc}")
             return
+        finally:
+            summarizer.shutdown()
 
         if result.status == "ABORTED":
-            out("\n[Agent] Terminated. Your prompt has been restored — edit it and press "
+            out("\n[Agent] Terminated. Your prompt has been restored - edit it and press "
                 "Enter to run again, or clear it to start over.")
             self._prefill = request
             out("")
@@ -288,9 +426,9 @@ class TerminalUI:
                 ans = prompt_select.ask_free_text(question)
             if ans:
                 answers.append(f"{field}: {ans}")
-                out(f"  ✓ {field}: {ans}")
+                out(f"  [x] {field}: {ans}")
             else:
-                out(f"  — {field}: (skipped)")
+                out(f"  [ ] {field}: (skipped)")
         out("")
         return "; ".join(answers)
 
