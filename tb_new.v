@@ -1,4 +1,3 @@
-```verilog
 `timescale 1ns / 1ps
 module tb_traffic_light();
 reg clk;
@@ -46,4 +45,4 @@ $display("SUCCESS: Traffic light sequence verified correctly.");
 $finish;
 end
 endmodule
-```
+
