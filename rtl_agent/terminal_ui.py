@@ -159,6 +159,7 @@ class TerminalUI:
         self.prompts: dict[str, str] | None = None
         self._prefill: str = ""  # restores the prompt text after an Esc abort
         self._summaries_enabled: bool = True  # parallel per-step summary agent
+        self._external_tb: str | None = None  # real testbench path, if provided
 
     # -- lifecycle ----------------------------------------------------------
     def start(self) -> int:
@@ -184,8 +185,45 @@ class TerminalUI:
         out("\nModel: deepseek-v4-pro")
         out("Thinking mode: enabled")
         out("Reasoning effort: max")
-        out("\nRTL Agent ready. Type a request, or /help for commands.\n")
+
+        self._choose_testbench_mode()
+
+        out("\nRTL Agent ready. Type a request, or /help for commands.")
+        out("(You can switch modes anytime with /testbench <path> or /testbench off.)\n")
         return self._repl()
+
+    def _choose_testbench_mode(self) -> None:
+        """One-time verification-mode choice presented at session start."""
+        out("")
+        choice = prompt_select.select_option(
+            "How should generated RTL be verified this session?",
+            [
+                "Artificial testbench  (the agent generates and self-checks one)",
+                "Real testbench        (you provide the testbench file)",
+            ],
+            allow_other=False,
+        )
+        if choice and choice.startswith("Real"):
+            self._prompt_for_testbench_path()
+        else:
+            self._external_tb = None
+            out("Mode: artificial testbench - the agent will generate and self-check its own.")
+
+    def _prompt_for_testbench_path(self) -> None:
+        while True:
+            raw = prompt_select.ask_free_text("Path to your testbench .v file (Enter to skip)")
+            if not raw:
+                self._external_tb = None
+                out("No path given; using an artificial testbench instead.")
+                return
+            path = Path(raw.strip().strip('"').strip("'")).expanduser()
+            if path.is_file():
+                self._external_tb = str(path)
+                out(f"Mode: real testbench -> {path}")
+                out("The agent will generate ONLY the DUT and run it against this testbench;")
+                out("no verification plan or agent testbench will be generated.")
+                return
+            out(f"[FAIL] Not a file: {path}. Try again, or press Enter to use artificial.")
 
     def _preflight(self, skip_api: bool = False) -> bool:
         report = run_preflight(self.config, skip_api=skip_api)
@@ -291,6 +329,7 @@ class TerminalUI:
                 out(f"iverilog: {self.config.iverilog_path}")
                 out(f"vvp:      {self.config.vvp_path}")
                 out(f"api key:  {self.config.masked_key()}")
+                out(f"testbench: {self._external_tb or '(self-verified; agent generates its own)'}")
         elif cmd == "/prompts":
             out(f"Prompt directory: {prompt_loader.PROMPT_DIRECTORY}")
             for name in prompt_loader.REQUIRED_PROMPTS:
@@ -308,6 +347,8 @@ class TerminalUI:
                 self._summaries_enabled = args[0] == "on"
             state = "on" if self._summaries_enabled else "off"
             out(f"Parallel summary agent is {state}.")
+        elif cmd == "/testbench":
+            self._handle_testbench(args)
         else:
             out(f"Unknown command: {cmd} (try /help)")
         return False
@@ -323,10 +364,34 @@ class TerminalUI:
         out("  /show-prompt <n>  Show one prompt (e.g. system, reflection)")
         out("  /reload-prompts   Reload master prompts for the next task")
         out("  /summary on|off   Toggle the parallel per-step summary agent")
+        out("  /testbench <path> Use a real testbench (DUT-only, no verification gen)")
+        out("  /testbench off    Clear the real testbench (back to self-verified)")
         out("  /help             Show this help")
         out("  /quit             Exit")
         out("")
         out("While a task is running, press Esc to terminate it and restore your prompt.")
+
+    def _handle_testbench(self, args: list[str]) -> None:
+        if not args:
+            if self._external_tb:
+                out(f"Real testbench: {self._external_tb}")
+                out("Next task will match this testbench; no verification is generated.")
+            else:
+                out("No real testbench set. The agent generates and self-checks its own.")
+                out("Usage: /testbench <path>   (or /testbench off to clear)")
+            return
+        if args[0] == "off":
+            self._external_tb = None
+            out("Real testbench cleared. Back to self-verified mode.")
+            return
+        path = Path(" ".join(args)).expanduser()
+        if not path.is_file():
+            out(f"[FAIL] Not a file: {path}")
+            return
+        self._external_tb = str(path)
+        out(f"Real testbench set: {path}")
+        out("For the next task the agent will generate ONLY the DUT, run it against this")
+        out("testbench, and skip verification-plan/testbench generation.")
 
     def _show_prompt(self, args: list[str]) -> None:
         if not args:
@@ -388,9 +453,16 @@ class TerminalUI:
         if watcher.available:
             out("[Agent] Working... press Esc to terminate and restore your prompt.")
 
+        if self._external_tb:
+            out(f"[Agent] Using real testbench: {self._external_tb} (no verification generated)")
+
         try:
             with watcher, status:
-                result = controller.run_task(request, should_cancel=lambda: watcher.cancelled)
+                result = controller.run_task(
+                    request,
+                    should_cancel=lambda: watcher.cancelled,
+                    external_testbench=self._external_tb,
+                )
             summarizer.drain()  # let in-flight summaries print before the result block
         except Exception as exc:  # noqa: BLE001
             out(f"[ERROR] Task failed: {exc}")

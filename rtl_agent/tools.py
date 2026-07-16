@@ -136,7 +136,13 @@ def _run_sim_tool() -> dict:
 class ToolRegistry:
     """Holds per-task tool state and gate flags, and dispatches tool calls."""
 
-    def __init__(self, config: Config, run: RunContext, assessment_context: str):
+    def __init__(
+        self,
+        config: Config,
+        run: RunContext,
+        assessment_context: str,
+        external_tb_path: Path | None = None,
+    ):
         self.config = config
         self.run = run
         self.assessment_context = assessment_context
@@ -148,9 +154,17 @@ class ToolRegistry:
         self.tb_path: Path | None = None
         self.last_sim_result: dict | None = None
 
+        # External-testbench mode: the real testbench is authoritative; the agent
+        # must not generate or modify one, and no verification plan is created.
+        self.external_mode = external_tb_path is not None
+        if self.external_mode:
+            self.tb_path = external_tb_path
+
         # Gates.
         self.generation_gate_open = False
-        self.verification_gate_open = False
+        # In external mode there is no verification-plan stage, so the gate that
+        # guards simulation is open from the start (the real testbench is ready).
+        self.verification_gate_open = self.external_mode
 
     # -- tool availability per stage ---------------------------------------
     def tools_for_stage(self, stage: str) -> list[dict]:
@@ -159,12 +173,11 @@ class ToolRegistry:
         if stage == "verification":
             return [_verification_tool(), _read_design_tool()]
         if stage in ("generation", "reflection"):
-            return [
-                _write_verilog_tool(),
-                _write_testbench_tool(),
-                _run_sim_tool(),
-                _read_design_tool(),
-            ]
+            tools = [_write_verilog_tool(), _run_sim_tool(), _read_design_tool()]
+            if not self.external_mode:
+                # Only the agent's self-verification flow may write a testbench.
+                tools.insert(1, _write_testbench_tool())
+            return tools
         return []
 
     # -- dispatch -----------------------------------------------------------
@@ -211,6 +224,9 @@ class ToolRegistry:
         return result
 
     def _save_verification_plan(self, args: dict) -> dict:
+        if self.external_mode:
+            return {"error": "A real testbench was provided; no verification plan is created in external mode.",
+                    "verification_plan_ready": False}
         if not self.generation_gate_open or self.design_spec is None:
             return {"error": "Design specification is not accepted yet.", "verification_plan_ready": False}
         plan = args.get("plan")
@@ -257,6 +273,9 @@ class ToolRegistry:
         }
 
     def _write_testbench_file(self, args: dict) -> dict:
+        if self.external_mode:
+            return {"error": "A real testbench was provided. You must not generate or modify a "
+                             "testbench; generate only the DUT and call run_simulation."}
         if not self.verification_gate_open:
             return {"error": "Testbench generation is blocked until the verification plan is frozen."}
         module_name = args.get("module_name", "")
@@ -295,10 +314,14 @@ class ToolRegistry:
     def _run_simulation(self, args: dict) -> dict:
         if not self.verification_gate_open:
             return {"error": "Simulation is blocked until the verification plan is frozen."}
-        if not (self.dut_path and self.tb_path):
-            return {"error": "Both the DUT and testbench must be written before simulation."}
+        if not self.dut_path:
+            return {"error": "The DUT must be written before simulation."}
+        if not self.tb_path:
+            return {"error": "No testbench available for simulation."}
 
-        result = _run_simulation(self.config, self.run.dir, self.dut_path, self.tb_path)
+        result = _run_simulation(
+            self.config, self.run.dir, self.dut_path, self.tb_path, external=self.external_mode
+        )
         self.last_sim_result = result
         self.run.save_simulation_log(result)
         return result

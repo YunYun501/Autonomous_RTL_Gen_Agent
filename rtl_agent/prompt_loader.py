@@ -19,6 +19,7 @@ REQUIRED_PROMPTS = (
     "verification_prompt.md",
     "testbench_prompt.md",
     "reflection_prompt.md",
+    "external_generation_prompt.md",
 )
 
 

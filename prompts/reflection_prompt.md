@@ -15,6 +15,9 @@ corrected complete design.
   wrong port name, clock/timing bug, hangs, or cannot execute a frozen case).
 - Never delete, weaken, or reverse a valid expected result. Never remove a frozen
   `VP-*` requirement. Never print the pass marker without executing all checks.
+- External testbench mode: if a real testbench was provided, it is authoritative
+  and read-only. Only correct the DUT; never modify, replace, or regenerate the
+  testbench (the `write_testbench_file` tool is unavailable in this mode).
 
 ## Action
 

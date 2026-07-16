@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable
 
 from .config import Config
@@ -22,6 +23,15 @@ MAX_TURNS_PER_STAGE = 12
 
 AskUser = Callable[[list[dict]], str]
 Progress = Callable[[str], None]
+
+_EXTERNAL_SPEC_ADDENDUM = (
+    "\n\n## External testbench mode\n"
+    "A real testbench is provided above and is authoritative. Extract the module "
+    "name and the exact port names, directions, and widths from how it instantiates "
+    "the DUT, and make the specification match them exactly (mark these as explicit, "
+    "sourced from the testbench). Do not create a verification plan; it is not used "
+    "in this mode."
+)
 
 
 class TaskAborted(Exception):
@@ -65,11 +75,20 @@ class Controller:
         self._turn = 0
         self._sim_attempts = 0
         self._reflections = 0
+        self._external_tb_content: str | None = None
         self._should_cancel: Callable[[], bool] = lambda: False
 
     # -- public entrypoint --------------------------------------------------
-    def run_task(self, request: str, should_cancel: Callable[[], bool] | None = None) -> TaskResult:
+    def run_task(
+        self,
+        request: str,
+        should_cancel: Callable[[], bool] | None = None,
+        external_testbench: str | None = None,
+    ) -> TaskResult:
         self._should_cancel = should_cancel or (lambda: False)
+        external = bool(external_testbench)
+        context = "external_testbench" if external else self.assessment_context
+
         run = RunContext(request, module_hint=request)
         hashes = run.snapshot_prompts(self.prompts)
         run.log_task_header(
@@ -80,7 +99,24 @@ class Controller:
             self.prompts,
             hashes,
         )
-        registry = ToolRegistry(self.config, run, self.assessment_context)
+
+        external_tb_path = None
+        self._external_tb_content = None
+        if external:
+            try:
+                content = Path(external_testbench).read_text(encoding="utf-8")
+            except OSError as exc:
+                run.log_final("INFRASTRUCTURE_FAILED", 0, 0, f"Cannot read testbench: {exc}")
+                return TaskResult(status="INFRASTRUCTURE_FAILED", run_dir=str(run.dir),
+                                  detail=f"Cannot read provided testbench: {external_testbench} ({exc})")
+            external_tb_path = run.path("external_testbench.v")
+            external_tb_path.write_text(content, encoding="utf-8")
+            self._external_tb_content = content
+            run.log(f"MODE: EXTERNAL TESTBENCH ({external_testbench})")
+        else:
+            run.log("MODE: SELF-VERIFIED (agent generates its own testbench)")
+
+        registry = ToolRegistry(self.config, run, context, external_tb_path=external_tb_path)
         try:
             return self._pipeline(request, run, registry)
         except TaskAborted:
@@ -100,6 +136,7 @@ class Controller:
         self._turn = 0
         self._sim_attempts = 0
         self._reflections = 0
+        external = registry.external_mode
         client = DeepSeekClient(
             self.config.deepseek_api_key,
             on_call=run.log_api_call,
@@ -109,32 +146,45 @@ class Controller:
             {"role": "system", "content": self.prompts["system_prompt.md"]},
             {"role": "user", "content": request},
         ]
+        if external:
+            messages.append({"role": "user", "content": self._tb_block()})
 
         # Stage: specification.
         self.progress("Interpreting the specification...")
-        messages.append({"role": "user", "content": self.prompts["specification_prompt.md"]})
-        run.log_stage("SPECIFICATION", self.prompts["specification_prompt.md"])
+        spec_prompt = self.prompts["specification_prompt.md"]
+        if external:
+            spec_prompt += _EXTERNAL_SPEC_ADDENDUM
+        messages.append({"role": "user", "content": spec_prompt})
+        run.log_stage("SPECIFICATION", spec_prompt)
         if not self._run_stage(client, messages, registry, "specification",
                                stop=lambda r: r.generation_gate_open,
                                label="Specification"):
             return self._fail(run, registry, "INFRASTRUCTURE_FAILED", "Design spec was not accepted.")
 
-        # Stage: verification planning.
-        self.progress("Creating a verification plan...")
-        messages.append({"role": "user", "content": self.prompts["verification_prompt.md"]})
-        run.log_stage("VERIFICATION PLANNING", self.prompts["verification_prompt.md"])
-        if not self._run_stage(client, messages, registry, "verification",
-                               stop=lambda r: r.verification_gate_open,
-                               label="Verification planning"):
-            return self._fail(run, registry, "INFRASTRUCTURE_FAILED", "Verification plan was not accepted.")
+        # Stage: verification planning (skipped entirely in external-testbench mode).
+        if not external:
+            self.progress("Creating a verification plan...")
+            messages.append({"role": "user", "content": self.prompts["verification_prompt.md"]})
+            run.log_stage("VERIFICATION PLANNING", self.prompts["verification_prompt.md"])
+            if not self._run_stage(client, messages, registry, "verification",
+                                   stop=lambda r: r.verification_gate_open,
+                                   label="Verification planning"):
+                return self._fail(run, registry, "INFRASTRUCTURE_FAILED", "Verification plan was not accepted.")
 
-        # Stage: RTL + testbench generation + first simulation.
-        self.progress("Generating RTL and self-checking testbench...")
-        messages.append({"role": "user", "content": self.prompts["testbench_prompt.md"]})
-        run.log_stage("RTL + TESTBENCH GENERATION", self.prompts["testbench_prompt.md"])
+        # Stage: RTL (+ testbench, self-verified only) generation + first simulation.
+        if external:
+            self.progress("Generating RTL to match the provided testbench...")
+            gen_prompt = self.prompts["external_generation_prompt.md"]
+            gen_stage, gen_label = "RTL GENERATION (EXTERNAL TESTBENCH)", "RTL generation (external testbench)"
+        else:
+            self.progress("Generating RTL and self-checking testbench...")
+            gen_prompt = self.prompts["testbench_prompt.md"]
+            gen_stage, gen_label = "RTL + TESTBENCH GENERATION", "RTL & testbench generation"
+        messages.append({"role": "user", "content": gen_prompt})
+        run.log_stage(gen_stage, gen_prompt)
         self._run_stage(client, messages, registry, "generation",
                         stop=lambda r: r.last_sim_result is not None,
-                        label="RTL & testbench generation")
+                        label=gen_label)
 
         if registry.last_sim_result is None:
             return self._fail(run, registry, "INFRASTRUCTURE_FAILED", "No simulation was run.")
@@ -252,6 +302,16 @@ class Controller:
             if transcript:
                 combined = f"STAGE: {label}\n\n" + "\n\n---\n\n".join(transcript)
                 self.on_stage(label, combined)
+
+    def _tb_block(self) -> str:
+        return (
+            "A real testbench has been provided and is authoritative. Generate a DUT "
+            "that matches its exact interface (module name and ports). You must NOT "
+            "generate or modify a testbench; use only this one for simulation.\n\n"
+            "## Provided testbench (read-only)\n```verilog\n"
+            + (self._external_tb_content or "")
+            + "\n```"
+        )
 
     def _fail(self, run, registry, status, detail) -> TaskResult:
         run.log_final(status, self._sim_attempts, self._reflections, detail,

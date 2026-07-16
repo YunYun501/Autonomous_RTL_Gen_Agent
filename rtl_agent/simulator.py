@@ -1,13 +1,17 @@
 """Icarus Verilog compile-and-simulate wrapper.
 
 Runs the compiler and runtime as separate subprocess stages with explicit argument
-lists (never a shell string), timeouts, and full output capture. Pass requires the
-``RTL_AGENT_TEST_PASS`` marker and absence of ``RTL_AGENT_TEST_FAIL`` -- a zero exit
-code alone is insufficient.
+lists (never a shell string), timeouts, and full output capture.
+
+For the agent's own development testbench, a pass requires the
+``RTL_AGENT_TEST_PASS`` marker and absence of ``RTL_AGENT_TEST_FAIL``. When a real
+(external) testbench is supplied it will not print those markers, so ``external=True``
+switches to an output heuristic instead.
 """
 
 from __future__ import annotations
 
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -18,12 +22,27 @@ from .testbench_validator import FAIL_MARKER, PASS_MARKER
 COMPILE_TIMEOUT = 60.0
 SIM_TIMEOUT = 60.0
 
+# Heuristic tokens for judging a real testbench's output (case-insensitive).
+_EXT_FAIL = re.compile(
+    r"\b(error|fail(ed|ure)?|mismatch|assert\w*|fatal|incorrect|wrong|violation|bad)\b",
+    re.IGNORECASE,
+)
+_EXT_PASS = re.compile(
+    r"\b(success|succeeded|passed|pass\b|all\s+tests?\s+pass\w*|test\s+passed|ok\b)\b",
+    re.IGNORECASE,
+)
+# Benign phrases that contain a "fail" word but indicate success; stripped first.
+_EXT_BENIGN = re.compile(
+    r"\b(no|0|zero|without|and)\s+(errors?|failures?|mismatches?)\b", re.IGNORECASE
+)
+
 
 def run_simulation(
     config: Config,
     work_dir: Path,
     dut_path: Path,
     tb_path: Path,
+    external: bool = False,
 ) -> dict:
     result = {
         "compile_succeeded": False,
@@ -109,7 +128,11 @@ def run_simulation(
     result["simulation_duration_s"] = round(time.time() - start, 3)
 
     stdout = sim.stdout or ""
-    if FAIL_MARKER in stdout:
+    if external:
+        passed, failure_type = _external_verdict(stdout, sim.stderr or "", sim.returncode)
+        result["passed"] = passed
+        result["failure_type"] = failure_type
+    elif FAIL_MARKER in stdout:
         result["failure_type"] = "functional_failure"
     elif PASS_MARKER not in stdout:
         result["failure_type"] = "missing_pass_marker"
@@ -117,3 +140,24 @@ def run_simulation(
         result["passed"] = True
 
     return result
+
+
+def _external_verdict(stdout: str, stderr: str, return_code: int):
+    """Judge a real testbench's result from its output (no agent markers).
+
+    Priority: a non-zero exit code or any failure keyword -> fail; otherwise, an
+    explicit success keyword or a clean run -> pass. Benign phrases like
+    "0 errors" are neutralized first so they are not read as failures.
+    """
+    if return_code not in (0, None):
+        return False, "functional_failure"
+
+    combined = f"{stdout}\n{stderr}"
+    neutralized = _EXT_BENIGN.sub(" ok ", combined)
+    has_fail = bool(_EXT_FAIL.search(neutralized))
+    has_pass = bool(_EXT_PASS.search(combined))
+
+    if has_fail:
+        return False, "functional_failure"
+    # No failure signal: an explicit success token or a clean run both pass.
+    return True, None
